@@ -6,6 +6,7 @@ The data is send/received through serial port.
 This script uses the 3.X version of the Arduino ESP32 core.
 
 Author: Juan M. Gandarias
+web: www.jmgandarias.com
 email: jmgandarias@uma.es
 
 */
