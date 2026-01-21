@@ -24,6 +24,32 @@ Repo for DC motor control using ESP32 and DC6V210RPM motor
 
 #### Measure velocity by discrete derivative
 
+# Software
+
+Install the python requirements for the GUI:
+
+```bash
+pip install -r requirements.txt
+```
+
+# Create a .exe (for windows)
+
+Install `pyinstaller`
+
+```bash
+pip install pyinstaller
+```
+
+Generate the .exe file
+
+First, go to where the .py file is, and then:
+
+```bash
+pyinstaller --onefile -w data_collection_gui.py
+```
+
+Once finished, the application file is inside the `dist` folder.
+
 # Modelling 
 
 ## Theoretical model
