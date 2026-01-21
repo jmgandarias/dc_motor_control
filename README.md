@@ -2,6 +2,28 @@
 
 Repo for DC motor control using ESP32 and DC6V210RPM motor
 
+# DC motor UMA platform
+
+## Connections
+
+### External LED
+
+#### Digital signal
+
+#### PWM 
+
+### H-bridge
+
+### Motor
+
+#### PWM
+
+### Encoder
+
+#### Measure position with Interrupts
+
+#### Measure velocity by discrete derivative
+
 # Modelling 
 
 ## Theoretical model

@@ -48,10 +48,14 @@ import serial.tools.list_ports
 import csv
 from datetime import datetime
 import os
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # Default serial settings and reader sleep interval
 DEFAULT_BAUD = 500000  # Must match Serial.begin() on ESP32
 READ_THREAD_SLEEP_S = 0.01  # Sleep between polls in the reader thread
+PLOT_UPDATE_MS = 100  # Plot refresh interval
+MAX_PLOT_POINTS = 5000  # Limit points for performance
 
 
 class ESP32StepGUI(tk.Tk):
@@ -186,13 +190,29 @@ class ESP32StepGUI(tk.Tk):
         self.exit_btn = ttk.Button(ctrl, text="Exit", command=self._on_exit)
         self.exit_btn.grid(row=0, column=2, **pad)
 
-        # Status text and log pane
+        # Status text
         self.status_var = tk.StringVar(value="Idle")
         ttk.Label(self, textvariable=self.status_var).pack(anchor="w", **pad)
 
+        # Notebook with Plot and Log tabs
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True, **pad)
+
+        # Plot tab
+        self.plot_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.plot_tab, text="Live Plot")
+
+        # Log tab
+        self.log_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.log_tab, text="Log")
+
         # Read-only log widget updated from the main thread by draining lines_queue
-        self.log = tk.Text(self, height=9, wrap="none", state="disabled")
-        self.log.pack(fill="both", expand=True, **pad)
+        self.log = tk.Text(self.log_tab, height=9, wrap="none", state="disabled")
+        self.log.pack(fill="both", expand=True)
+
+        # Initialize matplotlib figure in plot tab and schedule periodic updates
+        self._init_plot()
+        self.after(PLOT_UPDATE_MS, self._update_plot)
 
     # -------------------- Serial helpers --------------------
     def _list_ports(self):
@@ -409,11 +429,12 @@ class ESP32StepGUI(tk.Tk):
     def _handle_line(self, line: str):
         """Process a single text line from the ESP32.
 
-        Expected data line format: "PWM;pos;vel;time"
+                Expected data line format: "PWM;pos;vel;vel_filtered;time"
           - PWM: integer (but tolerant to floats like "12.0")
           - pos: float (radians)
-          - vel: float (rad/s)
-          - time: float (milliseconds)
+                    - vel: float (rad/s)
+                    - vel_filtered: float (rad/s)
+                    - time: float (milliseconds)
 
         Special control lines:
           - "READY": device readiness handshake; recorded in self.ready_seen and
@@ -447,7 +468,7 @@ class ESP32StepGUI(tk.Tk):
 
         # Parse semicolon-separated fields
         parts = line.split(";")
-        if len(parts) != 4:
+        if len(parts) != 5:
             return  # ignore malformed lines
 
         try:
@@ -455,13 +476,14 @@ class ESP32StepGUI(tk.Tk):
             pwm = int(float(parts[0]))
             pos = float(parts[1])
             vel = float(parts[2])
-            tms = float(parts[3])  # milliseconds reported by ESP32
+            velf = float(parts[3])
+            tms = float(parts[4])  # milliseconds reported by ESP32
         except ValueError:
             return  # ignore parse errors
 
         # Append row to shared buffer under lock
         with self.data_lock:
-            self.data_rows.append([pwm, pos, vel, tms])
+            self.data_rows.append([pwm, pos, vel, velf, tms])
 
     # -------------------- Save CSV --------------------
     def _save_csv(self):
@@ -497,7 +519,7 @@ class ESP32StepGUI(tk.Tk):
             # Write header + data rows
             with open(out_path, mode="w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["PWM", "pos_rad", "vel_rad_per_s", "time_ms"])
+                writer.writerow(["PWM", "pos_rad", "vel_rad_per_s", "vel_filtered_rad_per_s", "time_ms"])
                 writer.writerows(rows)
             self._log(f"Saved {len(rows)} rows to:\n{out_path}")
             return True
@@ -546,6 +568,100 @@ class ESP32StepGUI(tk.Tk):
         self.log.insert("end", message + "\n")
         self.log.see("end")
         self.log.configure(state="disabled")
+
+    # -------------------- Plot helpers --------------------
+    def _init_plot(self):
+        # Create matplotlib Figure with two subplots: position and velocity vs time
+        # Controls toolbar (pause/resume, series selection)
+        toolbar = ttk.Frame(self.plot_tab)
+        toolbar.pack(fill="x", padx=8, pady=4)
+
+        self.plot_paused = False
+        self.pause_btn = ttk.Button(toolbar, text="Pause Plot", command=self._toggle_plot_pause)
+        self.pause_btn.pack(side="left")
+
+        # Series selection checkboxes
+        self.show_pos_var = tk.IntVar(value=1)
+        self.show_vel_var = tk.IntVar(value=1)
+        self.show_velf_var = tk.IntVar(value=1)
+
+        ttk.Checkbutton(toolbar, text="Position", variable=self.show_pos_var, command=self._on_series_toggle).pack(side="left", padx=6)
+        ttk.Checkbutton(toolbar, text="Velocity", variable=self.show_vel_var, command=self._on_series_toggle).pack(side="left", padx=6)
+        ttk.Checkbutton(toolbar, text="Velocity (filtered)", variable=self.show_velf_var, command=self._on_series_toggle).pack(side="left", padx=6)
+
+        self.fig = Figure(figsize=(6, 4), dpi=100)
+        self.ax_pos = self.fig.add_subplot(2, 1, 1)
+        self.ax_vel = self.fig.add_subplot(2, 1, 2, sharex=self.ax_pos)
+
+        self.ax_pos.set_ylabel("pos [rad]")
+        self.ax_vel.set_ylabel("vel [rad/s]")
+        self.ax_vel.set_xlabel("time [s]")
+        self.ax_pos.grid(True, linestyle=":", alpha=0.6)
+        self.ax_vel.grid(True, linestyle=":", alpha=0.6)
+
+        (self.line_pos,) = self.ax_pos.plot([], [], color="tab:blue", label="pos")
+        (self.line_vel,) = self.ax_vel.plot([], [], color="tab:orange", label="vel")
+        (self.line_vel_filt,) = self.ax_vel.plot([], [], color="tab:green", label="vel_filt")
+        self.ax_pos.legend(loc="upper right")
+        self.ax_vel.legend(loc="upper right")
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_tab)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        # Apply initial visibility based on checkboxes
+        self._on_series_toggle()
+
+    def _update_plot(self):
+        # If paused, skip updating the plot (but keep scheduling)
+        if self.plot_paused:
+            self.after(PLOT_UPDATE_MS, self._update_plot)
+            return
+
+        # Copy data under lock to avoid blocking reader
+        with self.data_lock:
+            rows = list(self.data_rows)
+
+        if rows:
+            # Each row is [PWM, pos, vel, vel_filtered, tms]
+            # Limit number of points for performance
+            if len(rows) > MAX_PLOT_POINTS:
+                rows = rows[-MAX_PLOT_POINTS:]
+            t = [r[4] / 1000.0 for r in rows]
+            pos = [r[1] for r in rows]
+            vel = [r[2] for r in rows]
+            velf = [r[3] for r in rows]
+
+            # Update series data
+            self.line_pos.set_data(t, pos)
+            self.line_vel.set_data(t, vel)
+            self.line_vel_filt.set_data(t, velf)
+
+            # Autoscale axes to data
+            self.ax_pos.relim()
+            self.ax_pos.autoscale_view()
+            self.ax_vel.relim()
+            self.ax_vel.autoscale_view()
+
+            # Ensure x-limits cover data
+            if t:
+                self.ax_pos.set_xlim(t[0], t[-1] if t[-1] > t[0] else t[0] + 1e-3)
+
+            self.canvas.draw_idle()
+
+        # Schedule next update
+        self.after(PLOT_UPDATE_MS, self._update_plot)
+
+    def _toggle_plot_pause(self):
+        self.plot_paused = not self.plot_paused
+        self.pause_btn.configure(text="Resume Plot" if self.plot_paused else "Pause Plot")
+
+    def _on_series_toggle(self):
+        # Toggle visibility based on checkboxes
+        self.line_pos.set_visible(bool(self.show_pos_var.get()))
+        self.line_vel.set_visible(bool(self.show_vel_var.get()))
+        self.line_vel_filt.set_visible(bool(self.show_velf_var.get()))
+        self.canvas.draw_idle()
 
 
 if __name__ == "__main__":

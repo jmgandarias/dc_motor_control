@@ -40,6 +40,13 @@ volatile uint32_t last_time = 0; // last sample time in ms (as returned by timer
 const float pulses_per_revolution = 880.0;                      // encoder pulses per motor revolution
 const float radians_per_pulse = 2 * PI / pulses_per_revolution; // conversion factor pulses -> radians
 
+// Velocity moving-average filter (FIR)
+const int VEL_MA_WINDOW = 50; // number of samples in the moving average (10 samples ≈ 100 ms at 10 ms period)
+float vel_ma_buf[VEL_MA_WINDOW];
+int vel_ma_idx = 0;
+int vel_ma_count = 0;
+float vel_ma_sum = 0.0f;
+
 // Experiment control
 int experiment_time = pwm_max * 10; // duration of experiment in milliseconds
 bool start_experiment = false;      // true when experiment is running
@@ -124,6 +131,15 @@ void loop()
                 Serial.println("STARTED"); // <-- confirm reception
                 digitalWrite(LED_PIN, HIGH);
                 timerStart(timer);
+
+                // Reset moving-average filter state
+                vel_ma_idx = 0;
+                vel_ma_count = 0;
+                vel_ma_sum = 0.0f;
+                for (int i = 0; i < VEL_MA_WINDOW; ++i)
+                {
+                    vel_ma_buf[i] = 0.0f;
+                }
             }
         }
     }
@@ -148,9 +164,20 @@ void loop()
 
         // Calculate velocity (rad/s). Guard against division by zero on first sample.
         float vel = 0.0f;
+        float vel_filtered = 0.0f;
         if (elapsed_time > 0.0f)
         {
             vel = delta_pos / elapsed_time;
+            // Moving average filter over last VEL_MA_WINDOW velocity samples
+            vel_ma_sum -= vel_ma_buf[vel_ma_idx];
+            vel_ma_buf[vel_ma_idx] = vel;
+            vel_ma_sum += vel;
+            vel_ma_idx = (vel_ma_idx + 1) % VEL_MA_WINDOW;
+            if (vel_ma_count < VEL_MA_WINDOW)
+            {
+                vel_ma_count++;
+            }
+            vel_filtered = vel_ma_sum / (float)vel_ma_count;
         }
         // Experiment phases:
         // - first half: ramp
@@ -161,7 +188,7 @@ void loop()
             int pwm = current_time / 10;
             ledcWrite(PWM_CCW_PIN, pwm); // stop drive
             ledcWrite(PWM_CW_PIN, 0);
-            Serial.printf("%d;%.4f;%.4f;%d\n", pwm, pos, vel, current_time); // PWM;pos;vel;time
+            Serial.printf("%d;%.4f;%.4f;%.4f;%d\n", pwm, pos, vel, vel_filtered, current_time); // PWM;pos;vel;vel_filtered;time
         }
         else
         {
@@ -175,6 +202,15 @@ void loop()
             last_count = 0;
             last_time = 0;
             counter = 0;
+
+            // Reset moving-average filter state
+            vel_ma_idx = 0;
+            vel_ma_count = 0;
+            vel_ma_sum = 0.0f;
+            for (int i = 0; i < VEL_MA_WINDOW; ++i)
+            {
+                vel_ma_buf[i] = 0.0f;
+            }
         }
 
         // clear flag and store last-sample values
